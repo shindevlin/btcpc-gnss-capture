@@ -2,6 +2,7 @@
 name = "btcpc-gnss-capture"
 version = "0.1.0"
 edition = "2021"
+authors = ["Shin Devlin <shindevlin@proton.me>"]
 
 [[bin]]
 name = "btcpc-gnss-capture"
@@ -20,3 +21,4 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
+sha2 = "0.11.0"

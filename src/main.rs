@@ -1,7 +1,6 @@
 mod caster;
 mod chain;
 mod config;
-mod keypair;
 mod rtcm3;
 
 use crate::config::Config;

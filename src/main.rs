@@ -63,19 +63,83 @@ async fn main() -> Result<()> {
         std::process::exit(0);
     });
 
+    // Shared position lock: once a 1005 frame is seen, the ECEF position is stored.
+    // Subsequent sessions must match within 1m (10000 units = 1m in 0.1mm units).
+    let position_lock: Arc<Mutex<Option<(i64, i64, i64)>>> = Arc::new(Mutex::new(None));
+
     loop {
         let (socket, addr) = listener.accept().await?;
+        let src_ip = addr.ip().to_string();
+
+        // Reject connections that don't come from the configured device IP.
+        // (The DNAT rule already limits this at the kernel level, but defence in depth.)
+        if !config.device_ip.is_empty() && src_ip != config.device_ip {
+            warn!("Rejected connection from {} — expected {}", src_ip, config.device_ip);
+            continue;
+        }
+
         info!("NTRIP connection from {}", addr);
         let cfg = config.clone();
         let txs = caster_txs.clone();
-        tokio::spawn(handle_connection(socket, cfg, txs));
+        let pos_lock = Arc::clone(&position_lock);
+        tokio::spawn(handle_connection(socket, cfg, txs, pos_lock));
     }
+}
+
+/// Parse miner key from NTRIP SOURCE or Basic auth header.
+///
+/// NTRIP SOURCE protocol (used by Hyfix):
+///   "SOURCE <password> <mountpoint>\r\nSource-Sign: <hex_sig>\r\n..."
+///   password is the device serial number (miner key).
+///
+/// NTRIP CLIENT Basic auth (standard):
+///   "Authorization: Basic <base64(user:pass)>"
+///
+/// Returns (miner_key, source_sign_hex).
+fn parse_ntrip_miner_key(header: &[u8]) -> (Option<String>, Option<String>) {
+    let text = match std::str::from_utf8(header) {
+        Ok(t) => t,
+        Err(_) => return (None, None),
+    };
+
+    let mut miner_key = None;
+    let mut source_sign = None;
+
+    for line in text.lines() {
+        // NTRIP SOURCE line: "SOURCE <password> <mountpoint>"
+        if line.starts_with("SOURCE ") {
+            let parts: Vec<&str> = line.splitn(3, ' ').collect();
+            if parts.len() >= 2 {
+                miner_key = Some(parts[1].to_owned());
+            }
+        }
+        // Hyfix cryptographic signature
+        if line.to_lowercase().starts_with("source-sign:") {
+            source_sign = Some(line["source-sign:".len()..].trim().to_owned());
+        }
+        // Standard Basic auth fallback
+        let lower = line.to_lowercase();
+        if lower.starts_with("authorization:") && miner_key.is_none() {
+            let rest = line["authorization:".len()..].trim();
+            if let Some(b64) = rest.strip_prefix("Basic ").or_else(|| rest.strip_prefix("basic ")) {
+                use base64::Engine as _;
+                if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
+                    if let Ok(creds) = String::from_utf8(decoded) {
+                        miner_key = creds.splitn(2, ':').nth(1).map(str::to_owned);
+                    }
+                }
+            }
+        }
+    }
+
+    (miner_key, source_sign)
 }
 
 async fn handle_connection(
     mut socket: tokio::net::TcpStream,
     config: Config,
     caster_txs: Vec<caster::FrameSender>,
+    position_lock: Arc<Mutex<Option<(i64, i64, i64)>>>,
 ) {
     let mut buf: Vec<u8> = Vec::new();
     let mut raw = [0u8; 8192];
@@ -92,6 +156,43 @@ async fn handle_connection(
 
                 if !ntrip_acked {
                     if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let header = buf[..pos].to_vec();
+
+                        // Log the raw NTRIP header (first line only) for protocol discovery.
+                        if let Ok(text) = std::str::from_utf8(&header) {
+                            let first_line = text.lines().next().unwrap_or("").trim();
+                            info!("NTRIP header first line: {:?}", first_line);
+                            for line in text.lines().skip(1) {
+                                if !line.trim().is_empty() {
+                                    info!("NTRIP header: {:?}", line.trim());
+                                }
+                            }
+                        }
+
+                        // Validate miner key + log Source-Sign if device_sn configured.
+                        let (auth_key, sign_hex) = parse_ntrip_miner_key(&header);
+                        if !config.device_sn.is_empty() {
+                            match auth_key {
+                                Some(ref key) if key == &config.device_sn => {
+                                    if let Some(ref sig) = sign_hex {
+                                        info!("NTRIP auth OK: SN={} Source-Sign={}…", key, &sig[..16.min(sig.len())]);
+                                    } else {
+                                        info!("NTRIP auth OK: SN={} (no Source-Sign)", key);
+                                    }
+                                }
+                                Some(ref key) => {
+                                    warn!("NTRIP auth REJECTED: key '{}' != expected '{}'", key, config.device_sn);
+                                    let _ = socket.write_all(b"ERROR - Bad Password\r\n").await;
+                                    break;
+                                }
+                                None => {
+                                    warn!("NTRIP: no auth key in header — allowing (set BTCPC_GNSS_DEVICE_SN to enforce)");
+                                }
+                            }
+                        } else if let Some(ref sig) = sign_hex {
+                            info!("NTRIP Source-Sign present ({}…) — set BTCPC_GNSS_DEVICE_SN to enforce", &sig[..16.min(sig.len())]);
+                        }
+
                         if socket.write_all(b"ICY 200 OK\r\n\r\n").await.is_err() { break; }
                         ntrip_acked = true;
                         info!("NTRIP handshake complete — streaming RTCM3");
@@ -103,6 +204,30 @@ async fn handle_connection(
                 for frame in rtcm3::parse_frames(&mut buf) {
                     frame_count += 1;
                     total_bytes += frame.payload_bytes as u64;
+
+                    // Position lock: extract from type 1005 and validate it hasn't moved.
+                    if let Some(pos) = rtcm3::extract_1005_position(&frame) {
+                        let mut lock = position_lock.lock().unwrap();
+                        match *lock {
+                            None => {
+                                info!("Position lock established: ECEF ({}, {}, {})", pos.0, pos.1, pos.2);
+                                *lock = Some(pos);
+                            }
+                            Some(locked) => {
+                                // 10000 units = 1m (units are 0.1mm). Allow 2m drift.
+                                let drift = ((pos.0 - locked.0).abs())
+                                    .max((pos.1 - locked.1).abs())
+                                    .max((pos.2 - locked.2).abs());
+                                if drift > 20000 {
+                                    warn!(
+                                        "Position drift detected! Δ={:.2}m — dropping frame (possible spoof)",
+                                        drift as f64 / 10000.0
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                    }
 
                     for tx in &caster_txs {
                         let _ = tx.try_send(frame.raw.clone());

@@ -14,6 +14,7 @@ pub struct Caster {
 #[derive(Clone)]
 pub struct Config {
     pub device_ip:      String,
+    pub device_sn:      String,   // serial number — checked against NTRIP Authorization header
     pub geodnet_ip:     String,
     pub geodnet_port:   u16,
     pub listen_port:    u16,
@@ -33,6 +34,8 @@ impl Config {
         let device_ip = env::var("BTCPC_GNSS_DEVICE_IP")
             .or_else(|_| env::var("BTCPC_GNSS_HOST"))
             .unwrap_or_else(|_| "192.168.68.54".to_string());
+
+        let device_sn = env::var("BTCPC_GNSS_DEVICE_SN").unwrap_or_default();
 
         let geodnet_ip = env::var("BTCPC_GNSS_GEODNET_IP")
             .unwrap_or_else(|_| "52.8.236.207".to_string());
@@ -90,7 +93,7 @@ impl Config {
         ];
 
         Self {
-            device_ip, geodnet_ip, geodnet_port, listen_port,
+            device_ip, device_sn, geodnet_ip, geodnet_port, listen_port,
             iface, arp_spoof, gateway_ip, miner, api_port, auth_token,
             forward, chain_interval, casters,
         }
